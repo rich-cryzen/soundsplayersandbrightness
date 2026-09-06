@@ -1,0 +1,325 @@
+-- ==========================================================
+-- TELÃO - Script Server (ServerScriptService)
+-- ==========================================================
+
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService")
+local Workspace = game:GetService("Workspace")
+local SoundService = game:GetService("SoundService")
+local Lighting = game:GetService("Lighting")
+
+-- ==========================================================
+-- CONFIGURAÇÕES
+-- ==========================================================
+
+local NOME_AGRUPAMENTO = "telao dinheiro"
+
+-- proporção do card (baseado na referência: ~454 de largura x 520 de altura)
+local LARGURA_CARD = 454
+local ALTURA_CARD = 520
+local RATIO_TELAO = LARGURA_CARD / ALTURA_CARD
+
+-- volume do som tocado (Roblox aceita valores acima de 1, até 10)
+local VOLUME_SOM = 3
+
+-- comandos que só tocam som (nenhum deles mexe no card do telão)
+local COMANDOS = {
+	["!bomdia"] = { som = 78286188235361 },
+	["!nome"] = { som = 81724295747215 },
+	["!neste"] = { som = 84743048957882 },
+	["!apenas"] = { som = 130475591502609 },
+}
+
+-- comando "!brilhoX" (ex: !brilho2) -> ajusta Lighting.Brightness pra X, sem som
+local PREFIXO_BRILHO = "!brilho"
+
+local slotsTelao = {} -- Frames (nas faces grandes) onde o card carregado é colocado
+local somAtual = nil -- Sound tocando no momento (pra não sobrepor músicas)
+
+-- ==========================================================
+-- CRIAR O TELÃO (substitui o agrupamento "telao dinheiro")
+-- ==========================================================
+
+-- acha a Part real que serve de referência de posição/rotação
+-- (preserva a orientação original -- não usa bounding box, que
+-- "achata" a rotação e foi o motivo da imagem aparecer deitada)
+local function pegarParteReferencia(instancia)
+	if instancia:IsA("BasePart") then
+		return instancia
+	end
+
+	if instancia:IsA("Model") then
+		if instancia.PrimaryPart then
+			return instancia.PrimaryPart
+		end
+
+		local melhor, melhorArea = nil, 0
+
+		for _, item in ipairs(instancia:GetDescendants()) do
+			if item:IsA("BasePart") then
+				local area = math.max(
+					item.Size.X * item.Size.Y,
+					item.Size.X * item.Size.Z,
+					item.Size.Y * item.Size.Z
+				)
+
+				if area > melhorArea then
+					melhor = item
+					melhorArea = area
+				end
+			end
+		end
+
+		return melhor
+	end
+
+	return nil
+end
+
+local function criarSurfaceGui(telao, face)
+	local surfaceGui = Instance.new("SurfaceGui")
+	surfaceGui.Name = "TelaoGui_" .. face.Name
+	surfaceGui.Face = face
+	surfaceGui.LightInfluence = 0
+	surfaceGui.PixelsPerStud = 50
+	surfaceGui.Parent = telao
+
+	local slot = Instance.new("Frame")
+	slot.Name = "Slot"
+	slot.Size = UDim2.fromScale(1, 1)
+	slot.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	slot.BorderSizePixel = 0
+	slot.Parent = surfaceGui
+
+	return slot
+end
+
+local function criarTelao()
+	local agrupamentoAntigo = Workspace:FindFirstChild(NOME_AGRUPAMENTO, true)
+
+	if not agrupamentoAntigo then
+		warn("[Telao] Não encontrei nada chamado '" .. NOME_AGRUPAMENTO .. "' no Workspace.")
+		return
+	end
+
+	local parteReferencia = pegarParteReferencia(agrupamentoAntigo)
+
+	if not parteReferencia then
+		warn("[Telao] '" .. NOME_AGRUPAMENTO .. "' não tem nenhuma Part dentro pra usar de referência.")
+		return
+	end
+
+	local tamanhoOriginal = parteReferencia.Size
+	local cframeOriginal = parteReferencia.CFrame
+
+	-- Y = altura (vertical). Entre X e Z, o maior vira a largura visível
+	-- e o menor vira a espessura do telão -- e a largura é recalculada
+	-- pra bater com a proporção do card (evita esmagar a imagem).
+	local altura = tamanhoOriginal.Y
+	local largura = altura * RATIO_TELAO
+	local espessura = math.min(tamanhoOriginal.X, tamanhoOriginal.Z)
+
+	if espessura <= 0 then
+		espessura = 0.5
+	end
+
+	-- IMPORTANTE: a face "grande" da part (onde o card fica esticado
+	-- certinho, sem deitar) depende de qual eixo (X ou Z) recebeu a
+	-- largura. Front/Back mostram o plano X-Y; Right/Left mostram o
+	-- plano Z-Y. Antes o script sempre usava Front/Back, e quando a
+	-- largura caía no eixo Z isso jogava o card na face fina (errada),
+	-- fazendo a imagem aparecer deitada e esticada.
+	local novoTamanho
+	local facesGrandes
+
+	if tamanhoOriginal.X >= tamanhoOriginal.Z then
+		novoTamanho = Vector3.new(largura, altura, espessura)
+		facesGrandes = { Enum.NormalId.Front, Enum.NormalId.Back }
+	else
+		novoTamanho = Vector3.new(espessura, altura, largura)
+		facesGrandes = { Enum.NormalId.Right, Enum.NormalId.Left }
+	end
+
+	local pai = agrupamentoAntigo.Parent
+
+	local telao = Instance.new("Part")
+	telao.Name = "Telao"
+	telao.Size = novoTamanho
+	telao.CFrame = cframeOriginal
+	telao.Anchored = true
+	telao.CanCollide = true
+	telao.Material = Enum.Material.Metal
+	telao.Color = Color3.fromRGB(15, 15, 18)
+	telao.Parent = pai
+
+	-- os dois lados da face grande, pra funcionar de qualquer lado
+	-- sem eu ter que adivinhar pra que direção a Part original aponta
+	slotsTelao = {
+		criarSurfaceGui(telao, facesGrandes[1]),
+		criarSurfaceGui(telao, facesGrandes[2]),
+	}
+
+	agrupamentoAntigo:Destroy()
+end
+
+-- ==========================================================
+-- CARD (carregado como asset, igual a script das auras)
+-- ==========================================================
+
+local function encontrarGuiObject(raiz)
+	if raiz:IsA("GuiObject") then
+		return raiz
+	end
+
+	for _, item in ipairs(raiz:GetDescendants()) do
+		if item:IsA("GuiObject") then
+			return item
+		end
+	end
+
+	return nil
+end
+
+local function limparSlot(slot)
+	local antigo = slot:FindFirstChild("CardAtual")
+
+	if antigo then
+		antigo:Destroy()
+	end
+end
+
+local function mostrarCardNoTelao(assetId)
+	if not assetId or #slotsTelao == 0 then
+		return
+	end
+
+	local sucesso, objetos = pcall(game.GetObjects, game, "rbxassetid://" .. assetId)
+
+	if not sucesso or not objetos or not objetos[1] then
+		warn("[Telao] Não consegui carregar o card " .. tostring(assetId))
+		return
+	end
+
+	local cardOriginal = encontrarGuiObject(objetos[1])
+
+	if not cardOriginal then
+		warn("[Telao] O asset " .. tostring(assetId) .. " não tem nenhum elemento de GUI dentro.")
+		return
+	end
+
+	for _, slot in ipairs(slotsTelao) do
+		limparSlot(slot)
+
+		local card = cardOriginal:Clone()
+		card.Name = "CardAtual"
+		card.AnchorPoint = Vector2.new(0, 0)
+		card.Position = UDim2.fromScale(0, 0)
+		card.Size = UDim2.fromScale(1, 1)
+		card.Parent = slot
+	end
+end
+
+-- ==========================================================
+-- SOM
+-- ==========================================================
+
+local function tocarSom(assetId)
+	-- para o som anterior antes de tocar o novo, pra não sobrepor músicas
+	if somAtual and somAtual.Parent then
+		somAtual:Stop()
+		somAtual:Destroy()
+		somAtual = nil
+	end
+
+	local som = Instance.new("Sound")
+	som.SoundId = "rbxassetid://" .. assetId
+	som.Volume = VOLUME_SOM
+	som.Parent = SoundService
+	som:Play()
+
+	somAtual = som
+
+	som.Ended:Connect(function()
+		if somAtual == som then
+			somAtual = nil
+		end
+		som:Destroy()
+	end)
+
+	task.delay(600, function()
+		if som and som.Parent then
+			som:Destroy()
+		end
+	end)
+end
+
+-- ==========================================================
+-- BRILHO (comando "!brilhoX" -> Lighting.Brightness = X, sem som)
+-- ==========================================================
+
+local function tentarComandoBrilho(comando)
+	if comando:sub(1, #PREFIXO_BRILHO) ~= PREFIXO_BRILHO then
+		return false
+	end
+
+	local numeroTexto = comando:sub(#PREFIXO_BRILHO + 1)
+	local valor = tonumber(numeroTexto)
+
+	if not valor then
+		return false
+	end
+
+	Lighting.Brightness = valor
+	return true
+end
+
+-- ==========================================================
+-- COMANDOS DE CHAT
+-- ==========================================================
+
+TextChatService.MessageReceived:Connect(function(mensagemTexto)
+	local sucesso, erro = pcall(function()
+		if not mensagemTexto.TextSource then
+			return
+		end
+
+		local userId = mensagemTexto.TextSource.UserId
+		local player = Players:GetPlayerByUserId(userId)
+
+		if not player then
+			return
+		end
+
+		local comando = mensagemTexto.Text:lower():gsub("%s+", "")
+
+		-- primeiro tenta o padrão "!brilhoX" (ex: !brilho2)
+		if tentarComandoBrilho(comando) then
+			return
+		end
+
+		local dadosComando = COMANDOS[comando]
+
+		if not dadosComando then
+			return
+		end
+
+		tocarSom(dadosComando.som)
+
+		if dadosComando.textura then
+			mostrarCardNoTelao(dadosComando.textura)
+		end
+	end)
+
+	if not sucesso then
+		warn("[Telao] Erro ao processar comando: " .. tostring(erro))
+	end
+end)
+
+-- ==========================================================
+-- INICIALIZAÇÃO
+-- ==========================================================
+
+local sucessoTelao, erroTelao = pcall(criarTelao)
+if not sucessoTelao then
+	warn("[Telao] Erro ao criar o telão: " .. tostring(erroTelao))
+end
